@@ -30,6 +30,7 @@ import paddle
 import paddle.distributed as dist
 from paddle.distributed import fleet
 
+from ..utils.fault_tolerance import is_ft_env
 from ..utils.log import logger
 from .trainer_utils import (
     IntervalStrategy,
@@ -856,6 +857,14 @@ class TrainingArguments:
     save_sharding_stage1_model_include_freeze_params: Optional[bool] = field(
         default=False, metadata={"help": "Save Sharding Stage1 Model Exclude Freeze Params"}
     )
+    pdc_download_ckpt: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Download checkpoint in paddlecloud longjob environment"},
+    )
+    pdc_download_timeout: Optional[int] = field(
+        default=300,
+        metadata={"help": "Timeout seconds for downloading checkpoint from remote cluster."},
+    )
 
     def __post_init__(self):
         env_local_rank = int(os.environ.get("PADDLE_RANK_IN_NODE", -1))
@@ -1657,6 +1666,14 @@ class TrainingArguments:
             raise ValueError(
                 f"The local_ran: {self.local_rank} should be consistent with the world size: {paddle.distributed.get_world_size()}."
             )
+
+        # process fault tolerance settings
+        if not is_ft_env():
+            if self.pdc_download_ckpt:
+                logger.warning(
+                    "pdc_download_ckpt can only be set as true inside FT environment. Automatically disable it now."
+                )
+                self.pdc_download_ckpt = False
 
     def __str__(self):
         self_as_dict = asdict(self)

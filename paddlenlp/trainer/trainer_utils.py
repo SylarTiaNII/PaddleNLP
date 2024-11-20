@@ -44,8 +44,10 @@ from paddlenlp.ops import Topology
 
 from ..trainer.argparser import strtobool
 from ..transformers.tokenizer_utils_base import BatchEncoding
+from ..utils.fault_tolerance import PDC_DOWNLOAD_ERROR
 from ..utils.import_utils import is_paddle_cuda_available, is_psutil_available
 from ..utils.log import logger
+from ..utils.pdc_sdk import PDCErrorCode, PDCErrorMessageMap, pdc_tool
 
 __all__ = [
     "TrainOutput",
@@ -1073,3 +1075,35 @@ def set_hyrbid_parallel_seed(basic_seed, dataset_rank, tp_rank, pp_rank=0):
         tracker.add("global_seed", global_seed)
     if "local_seed" not in tracker.states_ and local_seed not in tracker.seeds_:
         tracker.add("local_seed", local_seed)
+
+
+def download_recovery_ckpt_from_pdc(recovery_checkpoint_path, timeout):
+    """Download checkpoint from PDC for resuming training after failover. Longjob envrionment is necessary.
+
+    Args:
+        recovery_checkpoint_path (`str`):
+            local path to load checkpoint for training recovery
+        timeout (`int`):
+            max wait time for download
+    """
+
+    try:
+        base_dir, download_dir = os.path.split(os.path.normpath(recovery_checkpoint_path))
+        if not os.path.exists(base_dir) and base_dir != "":
+            os.makedirs(base_dir, exist_ok=True)
+        download_step = int(_re_checkpoint.search(download_dir).groups()[0])
+    except Exception as e:
+        raise RuntimeError(f"{PDC_DOWNLOAD_ERROR}; Failed to parse checkpoint path, details: {e}")
+    start_time = time.time()
+    result = pdc_tool.pdc_download_checkpoint(download_step, timeout)
+    end_time = time.time()
+    if result == PDCErrorCode.Success:
+        logger.info(f"Successfully downloaded checkpoint from PDC, total time cost: {end_time - start_time} seconds.")
+    elif result == PDCErrorCode.LocalPathExist:
+        logger.warning(
+            f"Skipping download checkpoint since file exists at local, total time cost: {end_time - start_time} seconds."
+        )
+    else:
+        raise RuntimeError(
+            f"{PDC_DOWNLOAD_ERROR}; Error occurred when trying to download checkpoint from PDC, recovery_checkpoint_path: {recovery_checkpoint_path}, timeout: {timeout}; error details: {PDCErrorMessageMap[result]}"
+        )

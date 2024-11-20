@@ -14,21 +14,23 @@
 
 import json
 import os
+import queue
 import subprocess
+import threading
 import time
 from enum import Enum
 from typing import List
 
 from paddlenlp.utils.log import logger
 
-#
 PDC_AGENT_BIN = "/root/paddlejob/tools/agent"
 HASH_SUM_BIN = "/root/paddlejob/afs_tool/bin/b3sum"
+TRAIN_CONFIG = "/root/paddlejob/workspace/env_run/longjob/train.conf"
 TAR_BIN = "tar"
 
 
 class PDCErrorCode(Enum):
-    """错误码类型枚举"""
+    """Error Code For PDCTools usage"""
 
     # success
     Success = 0
@@ -38,11 +40,15 @@ class PDCErrorCode(Enum):
     DownloadFail = 1406
     AgentConfigInvalid = 1407
     AFSToolsNotExist = 1408
-    LocalPathNotExist = 1409
+    TrainConfigNotExist = 1409
+    LocalPathNotExist = 1410
 
     CommandFail = 1501
     CalculateHashFail = 1502
     InvalidArgument = 1503
+    CommandTimeout = 1504
+
+    UnknownError = 1999
 
 
 class PDCTools:
@@ -52,6 +58,7 @@ class PDCTools:
         """ """
         self._pdc_agent_bin = PDC_AGENT_BIN
         self._hash_sum_bin = HASH_SUM_BIN
+        self._train_config = TRAIN_CONFIG
         self._tar_bin = TAR_BIN
 
     def pdc_upload(self, remote_path: str, local_path: str) -> PDCErrorCode:
@@ -118,7 +125,109 @@ class PDCTools:
             logger.error(f"pdc upload failed: {e}")
             raise e
 
-    def pdc_download(self, remote_path: str, local_path: str) -> PDCErrorCode:
+    def pdc_download(self, remote_path: str, local_path: str, timeout: int) -> PDCErrorCode:
+        """
+        download data from afs/bos
+
+        Args:
+        remote_path str: the remote file path, afs/bos, such as afs://user/a/b/xx.tar
+        local_path str: local file directory
+        timeout int: max wait time in seconds
+
+        Return:
+        PDCErrorCode: indicate the status of pdc download
+        """
+
+        def _download_worker(remote_path, local_path, queue):
+            try:
+                result = self._pdc_download_impl(remote_path, local_path)
+                queue.put(result)
+            except Exception as e:
+                queue.put(str(e))
+            return
+
+        result_queue = queue.Queue()
+        thread = threading.Thread(
+            target=_download_worker,
+            args=(
+                remote_path,
+                local_path,
+                result_queue,
+            ),
+        )
+        thread.start()
+        logger.info(f"Begin downloading object of {remote_path} to {local_path} from PDC...")
+        start_time = time.time()
+        end_time = time.time()
+        last_log_time = start_time
+        while (end_time - start_time) < timeout:
+            if not thread.is_alive():
+                break
+            if end_time - last_log_time > 30:
+                # log every 30 seconds to avoid false detection by hangWatcher
+                logger.info(f"Still waiting for download, already passed {end_time - start_time} seconds...")
+                last_log_time = end_time
+            time.sleep(1)
+            end_time = time.time()
+        if thread.is_alive():
+            return PDCErrorCode.CommandTimeout
+        result = result_queue.get()
+        if isinstance(result, str):
+            logger.error(f"Unknown exception occured during download process, details: {result}")
+            return PDCErrorCode.UnknownError
+        return result
+
+    def pdc_download_checkpoint(self, resume_step: int, timeout: int) -> PDCErrorCode:
+        """
+        download checkpoints from afs/bos
+
+        Args:
+        resume_step int: the resume step number
+        timeout int: max wait time in seconds
+
+        Return:
+        PDCErrorCode: indicate the status of pdc download
+        """
+
+        def _download_worker(step, queue):
+            try:
+                result = self._pdc_download_checkpoint_impl(step)
+                queue.put(result)
+            except Exception as e:
+                queue.put(str(e))
+            return
+
+        result_queue = queue.Queue()
+        thread = threading.Thread(
+            target=_download_worker,
+            args=(
+                resume_step,
+                result_queue,
+            ),
+        )
+        thread.start()
+        logger.info(f"Begin downloading recovery checkpoint of step {resume_step} from PDC...")
+        start_time = time.time()
+        end_time = time.time()
+        last_log_time = start_time
+        while (end_time - start_time) < timeout:
+            if not thread.is_alive():
+                break
+            if end_time - last_log_time > 30:
+                # log every 30 seconds to avoid false detection by hangWatcher
+                logger.info(f"Still waiting for download, already passed {end_time - start_time} seconds...")
+                last_log_time = end_time
+            time.sleep(1)
+            end_time = time.time()
+        if thread.is_alive():
+            return PDCErrorCode.CommandTimeout
+        result = result_queue.get()
+        if isinstance(result, str):
+            logger.error(f"Unknown exception occured during download process, details: {result}")
+            return PDCErrorCode.UnknownError
+        return result
+
+    def _pdc_download_impl(self, remote_path: str, local_path: str) -> PDCErrorCode:
         """download data from afs/bos
 
         Args:
@@ -182,7 +291,7 @@ class PDCTools:
             logger.error(f"pdc upload failed: {e}")
             raise e
 
-    def pdc_download_checkpoint(self, step: int) -> PDCErrorCode:
+    def _pdc_download_checkpoint_impl(self, step: int) -> PDCErrorCode:
         """ "download checkpoint from afs/bos
 
         Args:
@@ -227,7 +336,10 @@ class PDCTools:
         if not os.path.exists(self._hash_sum_bin):
             logger.error(f"hash tool {self._hash_sum_bin} not found")
             return PDCErrorCode.AFSToolsNotExist
-        # TODO add more check
+        if not os.path.exists(self._train_config):
+            logger.error(f"train config {self._train_config} not found")
+            return PDCErrorCode.TrainConfigNotExist
+        # TODO(@zezhao): add more check
         return PDCErrorCode.Success
 
     def _exec_cmd(self, cmd_args: List[str]) -> (str, PDCErrorCode):
@@ -241,7 +353,7 @@ class PDCTools:
             result = subprocess.run(cmd_args, capture_output=True, text=True)
             if result.returncode != 0:
                 logger.error(f"exec cmd {cmd_args} failed, exit code: {result.returncode}, err: {result.stderr}")
-                # TODO 区分不同的错误码:
+                # TODO(@zezhao): add more error code
                 error_code = PDCErrorCode.CommandFail
             return result.stdout, error_code
         except Exception as e:
@@ -268,7 +380,7 @@ class PDCTools:
 
         Return:
         """
-        cmd_args = [self._hash_sum_bin, file_path]
+        cmd_args = [self._hash_sum_bin, "--num-threads", "16", file_path]
         try:
             result, error_code = self._exec_cmd(cmd_args)
             if error_code == PDCErrorCode.Success and len(result) > 0:
@@ -391,3 +503,20 @@ class PDCTools:
             if os.path.exists(file_path):
                 logger.info(f"clean tmp file: {file_path}")
                 os.remove(file_path)
+
+
+pdc_tool = PDCTools()
+PDCErrorMessageMap = {
+    PDCErrorCode.Success: "success",
+    PDCErrorCode.RemotePathNotExist: "remote path not exist",
+    PDCErrorCode.LocalPathExist: "local path exist",
+    PDCErrorCode.DownloadFail: "download fail",
+    PDCErrorCode.AgentConfigInvalid: "agent config invalid",
+    PDCErrorCode.AFSToolsNotExist: "afs tools not exist",
+    PDCErrorCode.TrainConfigNotExist: "train config not exist",
+    PDCErrorCode.LocalPathNotExist: "local path not exist",
+    PDCErrorCode.CommandFail: "download command fail",
+    PDCErrorCode.CalculateHashFail: "calculate hash fail",
+    PDCErrorCode.InvalidArgument: "invalid argument",
+    PDCErrorCode.CommandTimeout: "command timeout",
+}
