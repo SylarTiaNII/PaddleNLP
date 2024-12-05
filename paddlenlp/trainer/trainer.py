@@ -2308,6 +2308,120 @@ class Trainer:
                 paddle.save(state_dict, save_path)
             dist.barrier(mp_group)
 
+    def _save_checkpoint_flash(self):
+        assert not self.args.ignore_save_lr_and_optim, "ignore_save_lr_and_optim should be False when using flash"
+        assert self.args.use_hybrid_parallel, "use_hybrid_parallel should be True when using flash"
+        assert not self.args.use_unified_checkpoint, "use_unified_checkpoint should be False when using flash"
+        assert not strtobool(os.getenv("FLAG_LLM_PDC", "False")), "Dont support FLAG_LLM_PDC"
+        assert isinstance(self.model, PretrainedModel), "model should be a PretrainedModel when using flash"
+        assert (
+            self.args.should_save_sharding_stage1_model
+        ), "should_save_sharding_stage1_model should be True when using flash"
+        assert ShardingOption.FULL_SHARD not in self.args.sharding
+
+        # assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
+        self.runtime_timer.start("checkpoint saving time")
+
+        # Save model checkpoint
+        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+
+        run_dir = self.args.output_dir
+
+        output_dir = os.path.join(run_dir, checkpoint_folder)
+        os.makedirs(output_dir, exist_ok=True)
+
+        self._save_checkpoint_static(output_dir)
+        saved_signal_path = os.path.join(output_dir, f"saved_signal_{dist.get_rank()}")
+        self._save_checkpoint_dynamic(output_dir, saved_signal_path)
+        self.runtime_timer.stop()
+
+    def _save_checkpoint_dynamic(self, output_dir, saved_signal_path):
+        # save model states
+        if self.args.should_save_model_state:
+            logger.info(f"Saving model checkpoint to {output_dir}")
+            # Save a trained model and configuration using `save_pretrained()`.
+            # They can then be reloaded using `from_pretrained()`
+
+            merge_tensor_parallel = False
+            # peft model
+            # TODO: @ZHUI unifiy unwrap_model(self.model) and self.model
+            config_to_save = None
+            state_dict, config_to_save, weight_name_suffix = self.sharding_io.manipulate_state_dict_and_config(
+                self.model, merge_tensor_parallel=merge_tensor_parallel
+            )
+            self.model.save_pretrained(
+                output_dir,
+                state_dict=state_dict,
+                config_to_save=config_to_save,
+                merge_tensor_parallel=merge_tensor_parallel,
+                variant=weight_name_suffix,
+                save_function=self._save_ckpt_func,
+                is_main_process=self.args.should_save,
+            )
+
+        # save optimizer states
+        logger.info("Saving optimizer files.")
+        optimizer_name = _add_variant(OPTIMIZER_NAME, self.args.optimizer_name_suffix)
+        if self.dp_group.rank <= 0 or self.args.use_expert_parallel:
+            if self.dp_group.rank > 0:  # this should only work for MoE saving
+                self._save_ckpt_func(
+                    self._filter_moe_no_sync_optimizer_params(),
+                    os.path.join(output_dir, optimizer_name),
+                )
+            else:
+                state_dict = self.optimizer.state_dict()
+                save_path = os.path.join(output_dir, optimizer_name)
+                self._async_optimizer_saver.run(state_dict, save_path, saved_signal_path=saved_signal_path)
+
+        # save scheduler & scaler
+        if self.args.should_save or self.args.use_expert_parallel:
+            # FIXME: maybe only save one copy
+            paddle.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
+
+            if self.do_grad_scaling:
+                paddle.save(self.scaler.state_dict(), os.path.join(output_dir, SCALER_NAME))
+
+        # Save the Trainer state
+        if self.args.should_save:
+            self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
+
+        # Save RNG state in non-distributed training
+        rng_states = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "cuda": paddle.get_rng_state(),
+            "cpu": paddle.framework.core.default_cpu_generator().get_state(),
+        }
+        if self.args.use_hybrid_parallel:
+            rng_states[
+                "hybrid_parallel_rng_state_tracker"
+            ] = fleet.meta_parallel.get_rng_state_tracker().get_states_tracker()
+
+        if self.args.world_size > 1:
+            rng_states_list = []
+            paddle.distributed.all_gather_object(rng_states_list, rng_states)
+            if self.args.should_save:
+                paddle.save(rng_states_list, os.path.join(output_dir, f"rng_state_{self.args.world_size}.pth"))
+        else:
+            paddle.save(rng_states, os.path.join(output_dir, "rng_state.pth"))
+
+    def _save_checkpoint_static(self, output_dir):
+        # save tokenizer
+        if self.args.should_save:
+            if self.tokenizer is not None:
+                self.tokenizer.save_pretrained(output_dir)
+
+        # save training args
+        if self.args.should_save:
+            paddle.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
+
+        # save dataloader status
+
+        # save model meta
+        self.sharding_io.save_distributed_model_meta(output_dir)
+
+        # save user-defined files (static_name_to_dyg_name.json)
+
     def _save_checkpoint(self, model, metrics=None):
         # assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
         self.runtime_timer.start("checkpoint saving time")
