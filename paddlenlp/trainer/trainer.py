@@ -1116,7 +1116,7 @@ class Trainer:
                     self.timers and self.timers("optimizer-step").stop()
 
                     if optimizer_was_run:
-                        self.lr_scheduler.step()
+                        self.lr_scheduler.step(epoch=self.scheduler_update_step())
 
                     if enable_release_grads:
                         self.optimizer.clear_grad(set_to_zero=False)
@@ -1415,6 +1415,14 @@ class Trainer:
 
     def _get_learning_rate(self):
         return self.optimizer.get_lr()
+
+    def scheduler_update_step(self):
+        """
+        return None to get default update step maintained by self.lr_scheduler
+
+        Subclass can override this method if you want to inject some custom behavior
+        """
+        return None
 
     def get_train_dataloader(self):
         """
