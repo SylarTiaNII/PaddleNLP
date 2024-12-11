@@ -866,6 +866,10 @@ class TrainingArguments:
         default=300,
         metadata={"help": "Timeout seconds for downloading checkpoint from remote cluster."},
     )
+    pdc_use_flash_device: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Use flash device for storage of checkpoints and other usages"},
+    )
 
     def __post_init__(self):
         env_local_rank = int(os.environ.get("PADDLE_RANK_IN_NODE", -1))
