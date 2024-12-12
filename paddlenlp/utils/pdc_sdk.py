@@ -47,6 +47,7 @@ class PDCErrorCode(Enum):
     CalculateHashFail = 1502
     InvalidArgument = 1503
     CommandTimeout = 1504
+    CheckSumCommandFail = 1505
 
     UnknownError = 1999
 
@@ -488,6 +489,48 @@ class PDCTools:
         except Exception as e:
             logger.error(f"exec cmd {download_cmd_args} with error: {e}")
             raise Exception(f"exec cmd {download_cmd_args} with error: {e}")
+        return error_code
+
+    def pdc_fc_generate_checksum(self, path: str) -> PDCErrorCode:
+        """
+        Args
+        :param localPath:
+        :return:
+        """
+        if not os.path.exists(path):
+            logger.error(f"pdc_fc_generate_checksum gi{path} not exist")
+            return PDCErrorCode.CommandFail
+        generate_checksum_args = [self._pdc_agent_bin, "-mode", "command", "-type", "generateSum", "-path", f"{path}"]
+        error_code = PDCErrorCode.Success
+        try:
+            logger.info(f"begin to generate_sum path: {path}")
+            res, error_code = self._exec_cmd(generate_checksum_args)
+            if error_code == PDCErrorCode.Success:
+                logger.info(f"generate_sum {path} successfully")
+        except Exception as e:
+            logger.error(f"exec cmd {generate_checksum_args} with error: {e}")
+            return PDCErrorCode.CheckSumCommandFail
+        return error_code
+
+    def pdc_fc_do_check(self, path: str) -> PDCErrorCode:
+        """
+        Args
+        :param localPath:
+        :return:
+        """
+        if not os.path.exists(path):
+            logger.error(f"pdc_fc_do_check {path} not exist")
+            return PDCErrorCode.CommandFail
+        generate_checksum_args = [self._pdc_agent_bin, "-mode", "command", "-type", "checkSum", "-path", f"{path}"]
+        error_code = PDCErrorCode.Success
+        try:
+            logger.info(f"begin to check_sum path: {path}")
+            res, error_code = self._exec_cmd(generate_checksum_args)
+            if error_code == PDCErrorCode.Success:
+                logger.info(f"check_sum {path} successfully")
+        except Exception as e:
+            logger.error(f"exec cmd {generate_checksum_args} with error: {e}")
+            return PDCErrorCode.CheckSumCommandFail
         return error_code
 
     def _clean_tmp_files(self, tmp_files: List[str]):
