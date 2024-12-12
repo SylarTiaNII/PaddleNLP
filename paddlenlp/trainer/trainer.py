@@ -189,7 +189,7 @@ except:
     from paddle.fluid.dataloader.dataloader_iter import _DataLoaderIterBase
 
 
-__all__ = ["Trainer"]
+__all__ = ["Trainer", "TRAINING_ARGS_NAME", "TRAINER_STATE_NAME", "OPTIMIZER_NAME", "SCHEDULER_NAME", "SCALER_NAME"]
 
 
 class Trainer:
