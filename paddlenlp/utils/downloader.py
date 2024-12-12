@@ -38,9 +38,7 @@ from .pdc_sdk import (
     FLASH_DEVICE,
     PDCErrorCode,
     PDCErrorMessageMap,
-    pdc_backup_to_flash_device,
     pdc_flash_device_available,
-    pdc_flash_do_check,
     pdc_tool,
 )
 
@@ -519,6 +517,18 @@ def download_from_pdc(remote_path, local_path, timeout):
 def get_static_model_on_pdc(remote_path, local_path, timeout, enable_flash_device=False):
     """
     Get static model from PDC. Use flash device if possible.
+    This function has to be called after distributed env is initialized in distributed mode.
+    Args:
+        remote_path (`str`):
+            remote path url for download
+        local_path (`str`):
+            local path to place downloaded object
+        timeout (`int`):
+            max wait time for download
+        enable_flash_device (`bool`):
+            Whether to use flash device
+    Returns:
+        str: path to load static model
     """
     try:
         base_dir, target_dir = os.path.split(os.path.normpath(local_path))
@@ -527,6 +537,8 @@ def get_static_model_on_pdc(remote_path, local_path, timeout, enable_flash_devic
     except Exception as e:
         raise RuntimeError(f"{PDC_DOWNLOAD_ERROR}; Failed to parse checkpoint path, details: {e}")
 
+    assert target_dir != ".", f"{PDC_DOWNLOAD_ERROR}, illegal local_path: {local_path}."
+
     flash_path = os.path.join(FLASH_DEVICE, target_dir)
     persistent_path = local_path
 
@@ -534,7 +546,7 @@ def get_static_model_on_pdc(remote_path, local_path, timeout, enable_flash_devic
     if device_id != 0:
         logger.info("Waiting local process 0...")
         dist.barrier()
-        return flash_path if os.path.exists(flash_path) else persistent_path
+        return flash_path if (enable_flash_device and os.path.exists(flash_path)) else persistent_path
 
     # step 1: load from flash device if possible
     need_download_from_remote = True
@@ -543,15 +555,16 @@ def get_static_model_on_pdc(remote_path, local_path, timeout, enable_flash_devic
         logger.info(f"flash device is available, checking status on {flash_path}...")
         # skip download SC as default when flash device is available
         need_download_from_remote = False
-        if os.path.exists(flash_path) and pdc_flash_do_check(flash_path):
+        if os.path.exists(flash_path) and pdc_tool.pdc_flash_do_check(flash_path) == PDCErrorCode.Success:
             logger.info("Static model checked successfully on flash device, ready to load...")
         else:
             logger.warning(
                 "flash device is available but no valid static model found on flash device, need to download from remote."
             )
-            shutil.rmtree(flash_path)
             need_download_from_remote = True
             need_backup_to_flash = True
+    else:
+        logger.info("Flash device is not enabled or available, will download static model from remote.")
 
     # step 2: download from remote if neccesary
     if need_download_from_remote:
@@ -561,18 +574,17 @@ def get_static_model_on_pdc(remote_path, local_path, timeout, enable_flash_devic
 
     # step 3: backup to flash device if flash device is available
     if enable_flash_device and need_backup_to_flash:
-        result = pdc_backup_to_flash_device(persistent_path, flash_path)
+        result = pdc_tool.pdc_backup_to_flash_device(persistent_path, flash_path)
         if result == PDCErrorCode.Success:
             logger.info(f"Backup static model to flash device {flash_path} successfully.")
         else:
             logger.error(f"Backup static model to flash device failed, error details: {PDCErrorMessageMap[result]}.")
-            shutil.rmtree(flash_path)
 
     # step 4: return flash path if available, otherwise return persistent path
     if dist.get_world_size() > 1:
         logger.info("Local node process done, waiting other nodes...")
         dist.barrier()
-    if os.path.exists(flash_path):
+    if enable_flash_device and os.path.exists(flash_path):
         logger.info(f"static model is ready on flash device, path: {flash_path}")
         return flash_path
     else:
