@@ -428,16 +428,16 @@ class ShardingIO:
             )
         return state_dict, config_to_save, weight_name_suffix
 
-    def save_distributed_model_meta(self, dir):
+    def gather_distributed_model_meta(self):
         if not self.args.use_hybrid_parallel:
-            return
+            return None
 
         if not self.args.should_save_sharding_stage1_model:
-            return
+            return None
 
         nranks = dist.get_world_size()
         if nranks <= 1:
-            return
+            return None
 
         model_meta = {}
         parallel_config = self._get_distributed_strategy()
@@ -447,12 +447,7 @@ class ShardingIO:
         if sharding_metas:
             model_meta["sharding_metas"] = sharding_metas
 
-        if dist.get_rank():
-            return
-
-        path = os.path.join(dir, MODEL_META_NAME)
-        with open(path, "w") as f:
-            json.dump(model_meta, f)
+        return model_meta
 
     def _get_distributed_strategy(self):
         pp_degree = 1

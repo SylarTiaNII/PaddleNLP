@@ -858,6 +858,18 @@ class TrainingArguments:
     save_sharding_stage1_model_include_freeze_params: Optional[bool] = field(
         default=False, metadata={"help": "Save Sharding Stage1 Model Exclude Freeze Params"}
     )
+    enable_flash_save_mode: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Enable Flash Save Mode"},
+    )
+    save_tokenizer: Optional[bool] = field(
+        default=True,
+        metadata={"help": "Save tokenizer to output_dir."},
+    )
+    save_rng_states: Optional[bool] = field(
+        default=True,
+        metadata={"help": "Save rng states to output_dir."},
+    )
     pdc_download_ckpt: Optional[bool] = field(
         default=False,
         metadata={"help": "Download checkpoint in paddlecloud longjob environment"},
