@@ -152,6 +152,7 @@ from .trainer_utils import (  # set_hyrbid_parallel_seed,
 from .training_args import TrainingArguments
 from .utils import reshard as reshard_util
 from .utils.async_save import AsyncSaver
+from .utils.flash_checkpoint import get_fused_param_mappings
 from .utils.helper import (  # nested_truncate,
     broadcast_dp_optimizer,
     broadcast_moe_optimizer,
@@ -2353,8 +2354,8 @@ class Trainer:
         # fuse buffer if necessary before actual save
         if self.cached_fused_buffer_version != self.optimizer.fused_buffer_version:
             self._cache_meta_for_sharded_save()
-            # self.optimizer.set_merged_model_params(self.manipulated_state_dict)
-            # self.optimizer._maybe_refuse()
+            param_mappings, ipc_meta_mappings = get_fused_param_mappings(self.optimizer, self.manipulated_state_dict)
+            logger.info(f"rebuild param_mappings: {param_mappings}; ipc_meta_mappings: {ipc_meta_mappings}")
             self.cached_fused_buffer_version = self.optimizer.fused_buffer_version
 
         # Save model checkpoint
