@@ -99,6 +99,7 @@ from ..transformers.segment_parallel_utils import split_inputs_sequence_dim
 from ..transformers.tokenizer_utils import PretrainedTokenizer
 from ..utils.batch_sampler import DistributedBatchSampler as NlpDistributedBatchSampler
 from ..utils.env import (
+    CONFIG_NAME,
     LORA_WEIGHTS_NAME,
     PADDLE_MASTER_WEIGHTS_INDEX_NAME,
     PADDLE_PEFT_WEIGHTS_INDEX_NAME,
@@ -675,6 +676,7 @@ class Trainer:
             model_to_save.config.dtype = str(dtype).split(".")[1]
             self.manipulated_config_to_save = copy.deepcopy(model_to_save.config)
             self.manipulated_config_to_save.architectures = [model_to_save.__class__.__name__]
+            self.manipulated_config_to_save = self.manipulated_config_to_save.to_json_string(use_diff=True)
             logger.info("Cache manipulated model config done")
         self.model_meta = self.sharding_io.gather_distributed_model_meta()
         logger.info("Cache distributed model meta done.")
@@ -2373,19 +2375,10 @@ class Trainer:
 
     def _save_checkpoint_dynamic(self, output_dir, saved_signal_path):
         # save model states
+        model_state_path = _add_variant(PADDLE_WEIGHTS_NAME, self.manipulated_weight_suffix)
         if self.args.should_save_model_state:
             logger.info(f"Saving model checkpoint to {output_dir}")
-            # Save a trained model and configuration using `save_pretrained()`.
-            # They can then be reloaded using `from_pretrained()`
-            self.model.save_pretrained(
-                output_dir,
-                state_dict=self.manipulated_state_dict,
-                config_to_save=self.manipulated_config_to_save,
-                merge_tensor_parallel=False,
-                variant=self.manipulated_weight_suffix,
-                save_function=self._save_ckpt_func,
-                is_main_process=self.args.should_save,
-            )
+            paddle.save(self.manipulated_state_dict, os.path.join(output_dir, model_state_path))
 
         # save optimizer states
         logger.info("Saving optimizer files.")
@@ -2415,6 +2408,7 @@ class Trainer:
         if self.args.should_save:
             self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
 
+        # TODO(@gexiao): support saving rng states later
         # Save RNG state in non-distributed training
         if self.args.save_rng_states:
             rng_states = {
@@ -2437,6 +2431,13 @@ class Trainer:
                 paddle.save(rng_states, os.path.join(output_dir, "rng_state.pth"))
 
     def _save_checkpoint_static(self, output_dir):
+        # save model config
+        if self.args.should_save:
+            json_file_path = os.path.join(output_dir, CONFIG_NAME)
+            with open(json_file_path, "w", encoding="utf-8") as writer:
+                writer.write(self.manipulated_config_to_save)
+
+        # TODO(@gexiao): support saving tokenizer later
         # save tokenizer
         if self.args.should_save and self.args.save_tokenizer:
             if self.tokenizer is not None:
