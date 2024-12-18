@@ -37,20 +37,16 @@ from paddlenlp.transformers.model_utils import (
     unwrap_optimizer,
 )
 from paddlenlp.transformers.utils import paddlenlp_load
+from paddlenlp.utils.env import MODEL_META_NAME
 from paddlenlp.utils.log import logger
 from paddlenlp.utils.tools import get_env_device
 
 from . import reshard as reshard_util
 from .reshard import SHARDING_STRATEGY_V1, SHARDING_STRATEGY_V2, pp_reshard
 
-# Name of the files used for checkpointing
-TRAINING_ARGS_NAME = "training_args.bin"
-TRAINER_STATE_NAME = "trainer_state.json"
-
 OPTIMIZER_NAME = "optimizer.pdopt"
 SCHEDULER_NAME = "scheduler.pdparams"
 SCALER_NAME = "scaler.pdparams"
-MODEL_META_NAME = "model_meta.json"
 SHARDING_META_NAME = "shard_meta.json"
 
 
