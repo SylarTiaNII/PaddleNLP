@@ -99,10 +99,10 @@ from ..transformers.segment_parallel_utils import split_inputs_sequence_dim
 from ..transformers.tokenizer_utils import PretrainedTokenizer
 from ..utils.batch_sampler import DistributedBatchSampler as NlpDistributedBatchSampler
 from ..utils.env import (
-    CONFIG_NAME,
     LORA_WEIGHTS_NAME,
     MODEL_META_NAME,
     PADDLE_MASTER_WEIGHTS_INDEX_NAME,
+    PADDLE_OPTIMIZER_NAME,
     PADDLE_PEFT_WEIGHTS_INDEX_NAME,
     PADDLE_WEIGHTS_INDEX_NAME,
     PADDLE_WEIGHTS_NAME,
@@ -110,6 +110,8 @@ from ..utils.env import (
     SAFE_MASTER_WEIGHTS_INDEX_NAME,
     SAFE_PEFT_WEIGHTS_INDEX_NAME,
     SAFE_WEIGHTS_INDEX_NAME,
+    SCALER_NAME,
+    SCHEDULER_NAME,
     TRAINER_STATE_NAME,
     TRAINING_ARGS_NAME,
 )
@@ -173,11 +175,6 @@ from .utils.sharding_io import ShardingIO
 DEFAULT_CALLBACKS = [DefaultFlowCallback]
 DEFAULT_PROGRESS_CALLBACK = ProgressCallback
 
-OPTIMIZER_NAME = "optimizer.pdopt"
-SCHEDULER_NAME = "scheduler.pdparams"
-SCALER_NAME = "scaler.pdparams"
-
-
 if is_datasets_available():
     import datasets
 
@@ -192,8 +189,9 @@ try:
 except:
     from paddle.fluid.dataloader.dataloader_iter import _DataLoaderIterBase
 
+OPTIMIZER_NAME = PADDLE_OPTIMIZER_NAME  # for compatibility
 
-__all__ = ["Trainer", "TRAINING_ARGS_NAME", "TRAINER_STATE_NAME", "OPTIMIZER_NAME", "SCHEDULER_NAME", "SCALER_NAME"]
+__all__ = ["Trainer"]
 
 
 class Trainer:
@@ -372,11 +370,31 @@ class Trainer:
         self._load_ckpt_func = dist.load_state_dict if self.args.enable_auto_parallel else paddle.load
 
         if self.args.enable_flash_save_mode:
+            # Currently, flash save mode only support pretraining mode with hybrid parallel enabled
+            assert (
+                not self.args.ignore_save_lr_and_optim
+            ), "ignore_save_lr_and_optim should be False when using flash save mode"
+            assert self.args.use_hybrid_parallel, "use_hybrid_parallel must be True when using flash save mode"
+            assert (
+                not self.args.unified_checkpoint
+            ), "use_unified_checkpoint should be False when using flash save mode"
+            assert not strtobool(
+                os.getenv("FLAG_LLM_PDC", "False")
+            ), "Dont support FLAG_LLM_PDC when using flash save mode"
+            assert (
+                self.args.should_save_sharding_stage1_model
+            ), "should_save_sharding_stage1_model should be True when using flash save mode"
+            assert (
+                ShardingOption.FULL_SHARD not in self.args.sharding
+            ), "FULL_SHARD is not supported when using flash save mode"
+            assert not self.args.save_tokenizer, "save_tokenizer is not supported when using flash save mode"
+            assert not self.args.save_rng_states, "save_rng_states is not supported when using flash save mode"
+
+            # init attributes for flash save mode
             self.manipulated_state_dict = None
             self.manipulated_config_to_save = None
             self.manipulated_weight_suffix = None
             self.model_meta = None
-            self.cached_fused_buffer_version = 0
             self.flash_checkpoint_manager = None
         self.user_file_list = []
 
@@ -668,16 +686,16 @@ class Trainer:
         Create flash checkpoint manager.
         Has to be called after pipeline model is created.
         """
+        assert isinstance(self.model, PretrainedModel), "model should be a PretrainedModel when using flash"
         logger.info("Create flash checkpoint manager...")
-        # TODO: move to args
-        worker_num = 3
-        capacity_usage = 0.8
         pipeline_hooks_capacity = (
             unwrapped_model.forward_pipeline_parallel_hook_capacity
             + unwrapped_model.backward_pipeline_parallel_hook_capacity
         )
         self.flash_checkpoint_manager = FlashCheckpointManager(
-            worker_num=worker_num, pipeline_hooks_capacity=pipeline_hooks_capacity, capacity_usage=capacity_usage
+            worker_num=self.args.fc_workers_num,
+            pipeline_hooks_capacity=pipeline_hooks_capacity,
+            capacity_usage=self.args.fc_pipeline_hooks_capacity_usage,
         )
         for i in range(unwrapped_model.forward_pipeline_parallel_hook_capacity):
             unwrapped_model.register_forward_pipeline_parallel_hook(
@@ -690,13 +708,7 @@ class Trainer:
         logger.info("Create flash checkpoint manager done.")
 
     def maybe_update_flash_checkpoint_worker(self):
-        if not self.args.enable_flash_save_mode:
-            return
-
-        if self.optimizer.fused_buffer_version == 0:
-            return
-
-        if self.optimizer.fused_buffer_version == self.cached_fused_buffer_version:
+        if self.optimizer.fused_buffer_version == self.flash_checkpoint_manager.cache_version:
             return
 
         logger.info("Flash checkpoint workers need upgrade.")
@@ -709,7 +721,7 @@ class Trainer:
             self.optimizer.fused_states_buffer_ipc_meta,
         )
         model_states_meta = (param_mappings, ipc_meta_mappings)
-        optimizer_states_name_path = _add_variant(OPTIMIZER_NAME, self.args.optimizer_name_suffix)
+        optimizer_states_name_path = _add_variant(PADDLE_OPTIMIZER_NAME, self.args.optimizer_name_suffix)
         model_states_name_path = _add_variant(PADDLE_WEIGHTS_NAME, self.manipulated_weight_suffix)
 
         dynamic_objecs = {}
@@ -724,8 +736,9 @@ class Trainer:
         static_objects["model_meta"] = self.model_meta
         static_objects["user_file"] = self.user_file_list
 
-        self.flash_checkpoint_manager.update_flash_workers(dynamic_objecs, static_objects)
-        self.cached_fused_buffer_version = self.optimizer.fused_buffer_version
+        self.flash_checkpoint_manager.update_flash_workers(
+            self.optimizer.fused_buffer_version, dynamic_objecs, static_objects
+        )
 
     def _cache_meta_for_sharded_save(self):
         logger.info("Start caching metas for sharded save...")
@@ -2413,140 +2426,16 @@ class Trainer:
                 paddle.save(state_dict, save_path)
             dist.barrier(mp_group)
 
-    def _save_checkpoint_flash_exp(self):
+    def _save_checkpoint_flash(self):
+        self.runtime_timer.start("checkpoint saving time")
         self.maybe_update_flash_checkpoint_worker()
         checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
         flash_checkpoint_dir = None
         persistent_checkpoint_dir = os.path.join(self.args.output_dir, checkpoint_folder)
-        self.flash_checkpoint_manager.get_idle_worker_for_saving(flash_checkpoint_dir, persistent_checkpoint_dir)
-
-        # TODO: adapt flash for these two
-        os.makedirs(persistent_checkpoint_dir, exist_ok=True)
-        if self.args.should_save or self.args.use_expert_parallel:
-            paddle.save(self.lr_scheduler.state_dict(), os.path.join(persistent_checkpoint_dir, SCHEDULER_NAME))
-        if self.args.should_save:
-            self.state.save_to_json(os.path.join(persistent_checkpoint_dir, TRAINER_STATE_NAME))
-
-    def _save_checkpoint_flash(self):
-        assert not self.args.ignore_save_lr_and_optim, "ignore_save_lr_and_optim should be False when using flash"
-        assert self.args.use_hybrid_parallel, "use_hybrid_parallel should be True when using flash"
-        assert not self.args.unified_checkpoint, "use_unified_checkpoint should be False when using flash"
-        assert not strtobool(os.getenv("FLAG_LLM_PDC", "False")), "Dont support FLAG_LLM_PDC"
-        assert isinstance(self.model, PretrainedModel), "model should be a PretrainedModel when using flash"
-        assert (
-            self.args.should_save_sharding_stage1_model
-        ), "should_save_sharding_stage1_model should be True when using flash"
-        assert ShardingOption.FULL_SHARD not in self.args.sharding
-
-        return self._save_checkpoint_flash_exp()
-
-        # assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
-        self.runtime_timer.start("checkpoint saving time")
-
-        # fuse buffer if necessary before actual save
-        if self.cached_fused_buffer_version != self.optimizer.fused_buffer_version:
-            self._cache_meta_for_sharded_save()
-            param_mappings, ipc_meta_mappings = get_fused_param_mappings(self.optimizer, self.manipulated_state_dict)
-            logger.info(f"rebuild param_mappings: {param_mappings}; ipc_meta_mappings: {ipc_meta_mappings}")
-            self.cached_fused_buffer_version = self.optimizer.fused_buffer_version
-
-        # Save model checkpoint
-        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
-
-        run_dir = self.args.output_dir
-
-        output_dir = os.path.join(run_dir, checkpoint_folder)
-        os.makedirs(output_dir, exist_ok=True)
-
-        self._save_checkpoint_static(output_dir)
-        saved_signal_path = os.path.join(output_dir, f"saved_signal_{dist.get_rank()}")
-        self._save_checkpoint_dynamic(output_dir, saved_signal_path)
+        save_infos = (flash_checkpoint_dir, persistent_checkpoint_dir)
+        non_cached_objects = (self.lr_scheduler.state_dict(), self.state)
+        self.flash_checkpoint_manager.get_idle_worker_for_saving(save_infos, non_cached_objects)
         self.runtime_timer.stop()
-
-    def _save_checkpoint_dynamic(self, output_dir, saved_signal_path):
-        # save model states
-        model_state_path = _add_variant(PADDLE_WEIGHTS_NAME, self.manipulated_weight_suffix)
-        if self.args.should_save_model_state:
-            logger.info(f"Saving model checkpoint to {output_dir}")
-            paddle.save(self.manipulated_state_dict, os.path.join(output_dir, model_state_path))
-
-        # save optimizer states
-        logger.info("Saving optimizer files.")
-        optimizer_name = _add_variant(OPTIMIZER_NAME, self.args.optimizer_name_suffix)
-        if self.dp_group.rank <= 0 or self.args.use_expert_parallel:
-            if self.dp_group.rank > 0:  # this should only work for MoE saving
-                self._save_ckpt_func(
-                    self._filter_moe_no_sync_optimizer_params(),
-                    os.path.join(output_dir, optimizer_name),
-                )
-            else:
-                state_dict = self.optimizer.state_dict()
-                save_path = os.path.join(output_dir, optimizer_name)
-                self._save_ckpt_func(state_dict, save_path)
-                with open(saved_signal_path, mode="w+") as f:
-                    f.write("1")
-
-        # save scheduler & scaler
-        if self.args.should_save or self.args.use_expert_parallel:
-            # FIXME: maybe only save one copy
-            paddle.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
-
-            if self.do_grad_scaling:
-                paddle.save(self.scaler.state_dict(), os.path.join(output_dir, SCALER_NAME))
-
-        # Save the Trainer state
-        if self.args.should_save:
-            self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
-
-        # TODO(@gexiao): support saving rng states later
-        # Save RNG state in non-distributed training
-        if self.args.save_rng_states:
-            rng_states = {
-                "python": random.getstate(),
-                "numpy": np.random.get_state(),
-                "cuda": paddle.get_rng_state(),
-                "cpu": paddle.framework.core.default_cpu_generator().get_state(),
-            }
-            if self.args.use_hybrid_parallel:
-                rng_states[
-                    "hybrid_parallel_rng_state_tracker"
-                ] = fleet.meta_parallel.get_rng_state_tracker().get_states_tracker()
-
-            if self.args.world_size > 1:
-                rng_states_list = []
-                paddle.distributed.all_gather_object(rng_states_list, rng_states)
-                if self.args.should_save:
-                    paddle.save(rng_states_list, os.path.join(output_dir, f"rng_state_{self.args.world_size}.pth"))
-            else:
-                paddle.save(rng_states, os.path.join(output_dir, "rng_state.pth"))
-
-    def _save_checkpoint_static(self, output_dir):
-        # save model config
-        if self.args.should_save:
-            json_file_path = os.path.join(output_dir, CONFIG_NAME)
-            with open(json_file_path, "w", encoding="utf-8") as writer:
-                writer.write(self.manipulated_config_to_save)
-
-        # TODO(@gexiao): support saving tokenizer later
-        # save tokenizer
-        if self.args.should_save and self.args.save_tokenizer:
-            if self.tokenizer is not None:
-                self.tokenizer.save_pretrained(output_dir)
-
-        # save training args
-        if self.args.should_save:
-            args_file_path = os.path.join(output_dir, TRAINING_ARGS_NAME)
-            paddle.save(self.args, args_file_path)
-
-        # save dataloader status
-
-        # save model meta
-        if self.args.should_save:
-            path = os.path.join(output_dir, MODEL_META_NAME)
-            with open(path, "w") as f:
-                json.dump(self.model_meta, f)
-
-        # save user-defined files (static_name_to_dyg_name.json)
 
     def _save_checkpoint(self, model, metrics=None):
         if self.args.enable_flash_save_mode:
@@ -2571,7 +2460,7 @@ class Trainer:
 
         # only save model state dict, ignore optimizer and scheduler
         if not self.args.ignore_save_lr_and_optim:
-            optimizer_name = _add_variant(OPTIMIZER_NAME, self.args.optimizer_name_suffix)
+            optimizer_name = _add_variant(PADDLE_OPTIMIZER_NAME, self.args.optimizer_name_suffix)
             saved_signal_path = os.path.join(output_dir, f"saved_signal_{dist.get_rank()}")
 
             if self.args.use_hybrid_parallel:
@@ -2659,26 +2548,27 @@ class Trainer:
             self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
 
         # Save RNG state in non-distributed training
-        rng_states = {
-            "python": random.getstate(),
-            "numpy": np.random.get_state(),
-            "cuda": paddle.get_rng_state(),
-            "cpu": paddle.framework.core.default_cpu_generator().get_state(),
-        }
-        if self.args.use_hybrid_parallel:
-            rng_states[
-                "hybrid_parallel_rng_state_tracker"
-            ] = fleet.meta_parallel.get_rng_state_tracker().get_states_tracker()
+        if self.args.save_rng_states:
+            rng_states = {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "cuda": paddle.get_rng_state(),
+                "cpu": paddle.framework.core.default_cpu_generator().get_state(),
+            }
+            if self.args.use_hybrid_parallel:
+                rng_states[
+                    "hybrid_parallel_rng_state_tracker"
+                ] = fleet.meta_parallel.get_rng_state_tracker().get_states_tracker()
 
-        if self.args.world_size > 1:
-            rng_states_list = []
-            paddle.distributed.all_gather_object(rng_states_list, rng_states)
-            if self.args.should_save:
+            if self.args.world_size > 1:
+                rng_states_list = []
+                paddle.distributed.all_gather_object(rng_states_list, rng_states)
+                if self.args.should_save:
+                    os.makedirs(output_dir, exist_ok=True)
+                    paddle.save(rng_states_list, os.path.join(output_dir, f"rng_state_{self.args.world_size}.pth"))
+            else:
                 os.makedirs(output_dir, exist_ok=True)
-                paddle.save(rng_states_list, os.path.join(output_dir, f"rng_state_{self.args.world_size}.pth"))
-        else:
-            os.makedirs(output_dir, exist_ok=True)
-            paddle.save(rng_states, os.path.join(output_dir, "rng_state.pth"))
+                paddle.save(rng_states, os.path.join(output_dir, "rng_state.pth"))
 
         # Maybe delete some older checkpoints.
         # For hybrid parallel training, the checkpoint files maybe on different node.
@@ -2775,7 +2665,7 @@ class Trainer:
         # They can then be reloaded using `from_pretrained()`
 
         if self.args.should_save:
-            if self.tokenizer is not None:
+            if self.tokenizer is not None and self.args.save_tokenizer:
                 self.tokenizer.save_pretrained(output_dir)
             # Good practice: save your training arguments together with the trained model
             paddle.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
@@ -2880,7 +2770,7 @@ class Trainer:
         opt_state_dict = None
         if self.args.should_load_sharding_stage1_model:
             opt_state_dict = self.sharding_io.load_optimizer_state_with_reshard(
-                checkpoint, OPTIMIZER_NAME, self.model_wrapped
+                checkpoint, PADDLE_OPTIMIZER_NAME, self.model_wrapped
             )
         else:
             use_unified_checkpoint = False
@@ -2892,7 +2782,7 @@ class Trainer:
 
             if not use_unified_checkpoint:
                 if self.args.data_parallel_rank == 0 or self.args.use_expert_parallel:
-                    optimizer_name = _add_variant(OPTIMIZER_NAME, self.args.optimizer_name_suffix)
+                    optimizer_name = _add_variant(PADDLE_OPTIMIZER_NAME, self.args.optimizer_name_suffix)
                     path = os.path.join(checkpoint, optimizer_name)
                     if os.path.isfile(path):
                         opt_state_dict = paddle.load(path)
@@ -2927,7 +2817,7 @@ class Trainer:
             # Load in optimizer and scheduler states
             self.optimizer.set_state_dict(opt_state_dict)
         else:
-            optimizer_name = _add_variant(OPTIMIZER_NAME, self.args.optimizer_name_suffix)
+            optimizer_name = _add_variant(PADDLE_OPTIMIZER_NAME, self.args.optimizer_name_suffix)
             raise ValueError(f"optimizer-state-dict not found, opt: {os.path.join(checkpoint, optimizer_name)}.")
 
         if not self.args.ignore_load_lr_and_optim:

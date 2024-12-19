@@ -32,7 +32,14 @@ from paddle.incubate.tensor.manipulation import (
 )
 from paddle.optimizer.fusion_utils import FusionStorageHelper
 
-from paddlenlp.utils.env import CONFIG_NAME, MODEL_META_NAME, TRAINING_ARGS_NAME
+from paddlenlp.utils.env import (
+    CONFIG_NAME,
+    MODEL_META_NAME,
+    SCHEDULER_NAME,
+    TRAINER_STATE_NAME,
+    TRAINING_ARGS_NAME,
+)
+from paddlenlp.utils.fault_tolerance import FC_DUMP_ERROR
 from paddlenlp.utils.log import logger
 
 
@@ -51,6 +58,7 @@ class FCWorkerStatus(Enum):
     IDLE = 0
     OFFLOADING = 1
     DUMPING = 2
+    ERROR = 3
 
 
 def get_fused_param_mappings(optimizer, manipulated_state_dict):
@@ -59,9 +67,6 @@ def get_fused_param_mappings(optimizer, manipulated_state_dict):
     index = 0
     sharding_comm_buffers = optimizer._comm_buffer_list
     for buffer in sharding_comm_buffers:
-        # Assuming all the parameters excluded from master weights are float32
-        if buffer._params[0].dtype != paddle.float32:
-            continue
         ipc_meta_mappings[str(index)] = buffer.param_buffer_ipc_meta
         for k, v in manipulated_state_dict.items():
             logger.info(
@@ -119,6 +124,8 @@ class ParamFusionStorageHelper:
             if buffer_index not in self.inited_buffers.keys():
                 buffer_tuple = self.init_buffer(buffer_ipc_metas[buffer_index])
                 self.inited_buffers[buffer_index] = buffer_tuple
+            v["start"] = int(v["start"])
+            v["end"] = int(v["end"])
             v["logical_start"] = self.all_param_numel
             self.all_param_numel += v["end"] - v["start"]
             v["logical_end"] = self.all_param_numel
@@ -204,7 +211,7 @@ class FlashCheckpointManager:
     def __init__(self, worker_num, pipeline_hooks_capacity, capacity_usage):
         assert worker_num > 0, "worker_num must be greater than 0"
         assert capacity_usage <= 1.0, "capacity_usage must be less than or equal to 1.0"
-        self.save_version = 0
+        self.cache_version = 0
         self.worker_num = worker_num
         self.workers = []
         self.processes = []
@@ -236,27 +243,29 @@ class FlashCheckpointManager:
         self.ready_to_save = False
         atexit.register(self.terminate_workers)
 
-    def update_flash_workers(self, dynamic_objecs, static_objects):
+    def update_flash_workers(self, new_version, dynamic_objecs, static_objects):
+        self.report_error_worker()
+        self.cache_version = new_version
         assert self.current_worker is None, "[FC manager] current_worker must be None"
-        self.save_version += 1
-        task = (FCTaskType.UPDATE, [self.save_version, dynamic_objecs, static_objects])
-        logger.info(f"[FC manager] updating flash workers, verison: {self.save_version}")
+        task = (FCTaskType.UPDATE, [self.cache_version, dynamic_objecs, static_objects])
+        logger.info(f"[FC manager] updating flash workers, verison: {self.cache_version}")
         for worker in self.workers:
             worker.task_queue.put(task)
         logger.info("[FC manager] waiting workers update done")
         for worker in self.workers:
-            while worker.version.value != self.save_version:
+            while worker.version.value != self.cache_version:
                 logger.info(
-                    f"[FC manager] waiting worker{worker.worker_id} update. worker version: {worker.version.value}, expected version: {self.save_version}"
+                    f"[FC manager] waiting worker{worker.worker_id} update. worker version: {worker.version.value}, expected version: {self.cache_version}"
                 )
                 time.sleep(1)
             logger.info(
-                f"[FC manager] worker{worker.worker_id} updated. worker version: {worker.version.value}, expected version: {self.save_version}"
+                f"[FC manager] worker{worker.worker_id} updated. worker version: {worker.version.value}, expected version: {self.cache_version}"
             )
         logger.info("[FC manager] update all flash workers done")
         self.ready_to_save = True
 
-    def get_idle_worker_for_saving(self, flash_save_dir, persistent_save_dir):
+    def get_idle_worker_for_saving(self, save_infos, non_cached_objects):
+        self.report_error_worker()
         assert self.current_worker is None, "[FC manager] current_worker must be None"
         found_worker = False
         while True:
@@ -265,25 +274,33 @@ class FlashCheckpointManager:
                     self.current_worker = worker
                     found_worker = True
                     break
-            # TODO: skip logic here
             if found_worker:
                 break
             logger.info("[FC manager] Waiting for idle worker...")
             time.sleep(1)
-        task = (FCTaskType.PREPARE, (flash_save_dir, persistent_save_dir))
+        task = (FCTaskType.PREPARE, (save_infos, non_cached_objects))
+        logger.info("[FC manager] before putting task for prepare")
         self.current_worker.task_queue.put(task)
+        logger.info("[FC manager] after putting task for prepare")
 
     def sync_offload_status(self):
+        self.report_error_worker()
         assert self.current_worker is not None, "[FC manager] current_worker must not be None"
         while True:
-            # TODO: add maximum wait time
+            logger.info("[FC manager] Waiting current worker offloading done.")
             if self.current_worker.status.value == FCWorkerStatus.OFFLOADING.value:
-                logger.info("[FC manager] Waiting current worker offloading done.")
                 time.sleep(1)
             else:
+                logger.info("[FC manager] Current worker offloading done")
                 break
         self.current_pipeline_hook_step = 0
         self.current_worker = None
+
+    def report_error_worker(self):
+        for worker in self.workers:
+            if worker.status.value == FCWorkerStatus.ERROR.value:
+                logger.error(f"[FC manager] Worker{worker.worker_id} encountered error.")
+                raise RuntimeError(f"{FC_DUMP_ERROR}")
 
     def flash_checkpoint_pipeline_hook(self, hook_id):
         if self.current_worker is None:
@@ -345,6 +362,11 @@ class FlashCheckpointWorker:
         self.model_meta_content = None
         self.user_file_list = None
 
+        # for non cached objects saving
+        # TODO(@gexiao): remove lr scheduler saves
+        self.lr_scheduler = None
+        self.trainer_state = None
+
         # for dumping
         self.flash_save_dir = None
         self.persistent_save_dir = None
@@ -369,10 +391,12 @@ class FlashCheckpointWorker:
 
         self.version.value = version
 
-    def process_prepare_task(self, save_infos):
+    def process_prepare_task(self, prepares):
+        save_infos, non_cached_objects = prepares
         self.offloaded_numels = 0
         self.status.value = FCWorkerStatus.OFFLOADING.value
         self.flash_save_dir, self.persistent_save_dir = save_infos
+        self.lr_scheduler, self.trainer_state = non_cached_objects
 
     def process_offload_task(self):
         actual_offload_size = (
@@ -406,17 +430,37 @@ class FlashCheckpointWorker:
 
         # continue to process dumping task at the last chunk
         if self.offloaded_numels == self.all_numel:
-            self.process_dump_task()
+            need_report_error = self.process_dump_task()
             self.offloaded_numels = 0
-            self.status.value = FCWorkerStatus.IDLE.value
+            if need_report_error:
+                self.status.value = FCWorkerStatus.ERROR.value
+            else:
+                self.status.value = FCWorkerStatus.IDLE.value
 
     def process_dump_task(self):
+        """
+        dump saved objects to either flash device or persistent device
+        Notice:
+        1. If dumping to flash device failed, the process will move on for other task
+        2. If dumping to persistent device failed, the process will change status to fail, and the main process will raise Error.
+        """
+        need_report_error = False
         if self.flash_save_dir:
-            self.process_dump_task_impl(self.flash_save_dir)
-            logger.info(f"[FC worker{self.worker_id}] Dumping to flash device done: {self.flash_save_dir}")
+            try:
+                self.process_dump_task_impl(self.flash_save_dir)
+                logger.info(f"[FC worker{self.worker_id}] Dumping to flash device done: {self.flash_save_dir}")
+            except Exception as e:
+                logger.error(f"[FC worker{self.worker_id}] Failed to dump to flash device: {e}")
         if self.persistent_save_dir:
-            self.process_dump_task_impl(self.persistent_save_dir)
-            logger.info(f"[FC worker{self.worker_id}] Dumping to persistent device done: {self.persistent_save_dir}")
+            try:
+                self.process_dump_task_impl(self.persistent_save_dir)
+                logger.info(
+                    f"[FC worker{self.worker_id}] Dumping to persistent device done: {self.persistent_save_dir}"
+                )
+            except Exception as e:
+                logger.error(f"[FC worker{self.worker_id}] Failed to dump to persistent device: {e}")
+                need_report_error = True
+        return need_report_error
 
     def process_dump_task_impl(self, output_dir):
         os.makedirs(output_dir, exist_ok=True)
@@ -450,6 +494,16 @@ class FlashCheckpointWorker:
         # Step2.2: save optimizer states
         optimizer_state_name_path = os.path.join(output_dir, self.optimizer_states_name_path)
         paddle.save(self.optimizer_fusion_storage_helper.state_dict(), optimizer_state_name_path)
+
+        # Step2.3: save LR Scheduler (To be removed)
+        lr_state_name_path = os.path.join(output_dir, SCHEDULER_NAME)
+        if self.device_id == 0:
+            paddle.save(self.lr_scheduler, lr_state_name_path)
+
+        # Step2.4: save TrainerState
+        trainer_state_name_path = os.path.join(output_dir, TRAINER_STATE_NAME)
+        if self.device_id == 0:
+            self.trainer_state.save_to_json(trainer_state_name_path)
 
         # Step3: dump save signals
         saved_signal_path = os.path.join(output_dir, f"saved_signal_{self.global_rank}")
@@ -508,3 +562,6 @@ class FlashCheckpointWorker:
         param_offload_numel = self.param_fusion_storage_helper.all_param_numel
         self.all_numel = optimizer_offload_numel + param_offload_numel
         self.chunk_size_in_numel = (self.all_numel - 1) // self.offload_chunks + 1
+        logger.info(
+            f"[FC worker{self.worker_id}] All numel: {self.all_numel}, Offload chunks: {self.offload_chunks}, Chunk size: {self.chunk_size_in_numel}]"
+        )

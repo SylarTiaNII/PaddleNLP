@@ -862,6 +862,18 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Enable Flash Save Mode"},
     )
+    fc_workers_num: Optional[int] = field(
+        default=3,
+        metadata={
+            "help": "The worker num for flash save mode. Increase to gain performance but cost more memory and cpu usage."
+        },
+    )
+    fc_pipeline_hooks_capacity_usage: Optional[float] = field(
+        default=0.6,
+        metadata={
+            "help": "Set pipeline hook capacity usage ratio. Lower value brings faster save speed but may effect calculation speed."
+        },
+    )
     save_tokenizer: Optional[bool] = field(
         default=True,
         metadata={"help": "Save tokenizer to output_dir."},
