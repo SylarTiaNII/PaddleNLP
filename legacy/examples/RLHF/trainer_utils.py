@@ -28,7 +28,6 @@ from paddle.io import DataLoader
 
 from paddlenlp.generation.utils import GenerationMixin
 from paddlenlp.trainer.trainer import (
-    TRAINER_STATE_NAME,
     HybridParallelOptimizer,
     NlpDistributedBatchSampler,
     ShardingOption,
@@ -52,6 +51,7 @@ from paddlenlp.transformers.tokenizer_utils_base import (
     PaddingStrategy,
     TruncationStrategy,
 )
+from paddlenlp.utils.env import TRAINER_STATE_NAME
 
 
 # ########## patches for Trianer ##########
