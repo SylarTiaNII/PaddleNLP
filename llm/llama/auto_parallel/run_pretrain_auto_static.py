@@ -38,10 +38,7 @@ from paddlenlp.trainer import (
     get_last_checkpoint,
     speed_metrics,
 )
-from paddlenlp.trainer.trainer_utils import (
-    PREFIX_CHECKPOINT_DIR,
-    _get_distributed_seeds,
-)
+from paddlenlp.trainer.trainer_utils import _get_distributed_seeds
 from paddlenlp.transformers import (
     AutoTokenizer,
     CosineAnnealingWithWarmupDecay,
@@ -49,6 +46,7 @@ from paddlenlp.transformers import (
     LlamaConfig,
     LlamaForCausalLMAuto,
 )
+from paddlenlp.utils.env import PREFIX_CHECKPOINT_DIR
 from paddlenlp.utils.log import logger
 
 MODEL_CLASSES = {

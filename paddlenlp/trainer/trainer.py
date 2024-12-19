@@ -106,6 +106,7 @@ from ..utils.env import (
     PADDLE_PEFT_WEIGHTS_INDEX_NAME,
     PADDLE_WEIGHTS_INDEX_NAME,
     PADDLE_WEIGHTS_NAME,
+    PREFIX_CHECKPOINT_DIR,
     PREFIX_WEIGHTS_NAME,
     SAFE_MASTER_WEIGHTS_INDEX_NAME,
     SAFE_PEFT_WEIGHTS_INDEX_NAME,
@@ -137,7 +138,6 @@ from .trainer_callback import (
     TrainerState,
 )
 from .trainer_utils import (  # set_hyrbid_parallel_seed,
-    PREFIX_CHECKPOINT_DIR,
     EvalLoopOutput,
     EvalPrediction,
     IterableDatasetShard,

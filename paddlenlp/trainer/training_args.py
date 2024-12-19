@@ -30,8 +30,10 @@ import paddle
 import paddle.distributed as dist
 from paddle.distributed import fleet
 
+from ..utils.env import PREFIX_CHECKPOINT_DIR
 from ..utils.fault_tolerance import is_ft_env
 from ..utils.log import logger
+from ..utils.pdc_sdk import FLASH_DEVICE
 from .trainer_utils import (
     IntervalStrategy,
     OptimizerNames,
@@ -894,6 +896,10 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Use flash device for storage of checkpoints and other usages"},
     )
+    flash_save_steps: Optional[int] = field(
+        default=0,
+        metadata={"help": "Save checkpoints on flash device every this many steps. Default is 0 which disables it"},
+    )
 
     def __post_init__(self):
         env_local_rank = int(os.environ.get("PADDLE_RANK_IN_NODE", -1))
@@ -1707,6 +1713,15 @@ class TrainingArguments:
                     "pdc_download_ckpt can only be set as true inside FT environment. Automatically disable it now."
                 )
                 self.pdc_download_ckpt = False
+        else:
+            pdc_flash_init_step = os.getenv("PDC_FLASH_INIT_STEP")
+            if self.pdc_use_flash_device and pdc_flash_init_step is not None:
+                self.resume_from_checkpoint = os.path.join(
+                    FLASH_DEVICE, f"{PREFIX_CHECKPOINT_DIR}-{pdc_flash_init_step}"
+                )
+                logger.warning(
+                    f"PDC_FLASH_INIT_STEP {pdc_flash_init_step} has been specified, automatically resume from FLASH_DEVICE: {self.resume_from_checkpoint}"
+                )
 
     def __str__(self):
         self_as_dict = asdict(self)
