@@ -1707,21 +1707,34 @@ class TrainingArguments:
             )
 
         # process fault tolerance settings
-        if not is_ft_env():
+        if is_ft_env():
+            pdc_flash_checkpoint_init_step = os.getenv("PDC_FC_INIT_STEP")
+            if (
+                self.pdc_use_flash_device
+                and pdc_flash_checkpoint_init_step is not None
+                and int(pdc_flash_checkpoint_init_step) > 0
+            ):
+                self.resume_from_checkpoint = os.path.join(
+                    FLASH_DEVICE, f"{PREFIX_CHECKPOINT_DIR}-{pdc_flash_checkpoint_init_step}"
+                )
+                logger.warning(
+                    f"PDC_FC_INIT_STEP {pdc_flash_checkpoint_init_step} has been specified, automatically resume from FLASH_DEVICE: {self.resume_from_checkpoint}"
+                )
+            if self.flash_save_steps > 0:
+                assert (
+                    self.pdc_use_flash_device and self.enable_flash_save_mode
+                ), "flash_save_steps should only be set in flash save mode with flash device mounted."
+        else:
             if self.pdc_download_ckpt:
                 logger.warning(
                     "pdc_download_ckpt can only be set as true inside FT environment. Automatically disable it now."
                 )
                 self.pdc_download_ckpt = False
-        else:
-            pdc_flash_init_step = os.getenv("PDC_FLASH_INIT_STEP")
-            if self.pdc_use_flash_device and pdc_flash_init_step is not None:
-                self.resume_from_checkpoint = os.path.join(
-                    FLASH_DEVICE, f"{PREFIX_CHECKPOINT_DIR}-{pdc_flash_init_step}"
-                )
+            if self.flash_save_steps > 0:
                 logger.warning(
-                    f"PDC_FLASH_INIT_STEP {pdc_flash_init_step} has been specified, automatically resume from FLASH_DEVICE: {self.resume_from_checkpoint}"
+                    "flash_save_steps is only recommended to be set inside FT environment. Automatically disable it now."
                 )
+                self.flash_save_steps = 0
 
     def __str__(self):
         self_as_dict = asdict(self)

@@ -43,7 +43,7 @@ from paddlenlp.ops import Topology
 
 from ..trainer.argparser import strtobool
 from ..transformers.tokenizer_utils_base import BatchEncoding
-from ..utils.env import _re_checkpoint
+from ..utils.env import PREFIX_CHECKPOINT_DIR, _re_checkpoint  # noqa for compatibility
 from ..utils.fault_tolerance import PDC_DOWNLOAD_ERROR
 from ..utils.import_utils import is_paddle_cuda_available, is_psutil_available
 from ..utils.log import logger
