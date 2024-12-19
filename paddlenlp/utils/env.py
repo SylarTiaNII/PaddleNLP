@@ -19,6 +19,7 @@ PPNLP_HOME              -->  the root directory for storing PaddleNLP related da
 └─ DATA_HOME         -->  Store automatically downloaded datasets.
 """
 import os
+import re
 
 
 def _get_user_home():
@@ -104,6 +105,10 @@ SAFE_MASTER_WEIGHTS_INDEX_NAME = "master_weights.safetensors.index.json"
 
 SAFE_PEFT_WEIGHTS_NAME = "peft_model.safetensors"
 SAFE_PEFT_WEIGHTS_INDEX_NAME = "peft_model.safetensors.index.json"
+
+# checkpoint dir name and regex
+PREFIX_CHECKPOINT_DIR = "checkpoint"
+_re_checkpoint = re.compile(r"^" + PREFIX_CHECKPOINT_DIR + r"\-(\d+)$")
 
 # Name of the files used for checkpointing
 TRAINING_ARGS_NAME = "training_args.bin"
