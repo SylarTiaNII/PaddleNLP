@@ -747,11 +747,6 @@ class Trainer:
                 paddle.distributed.barrier()
             logger.info("All processes finished downloading from pdc")
 
-        # memory metrics - must set up as early as possible
-        self._memory_tracker.start()
-        if not self.args.should_load_sharding_stage1_model:
-            self._load_from_checkpoint(resume_from_checkpoint)
-
         train_dataloader = self.get_train_dataloader()
 
         total_train_batch_size = args.train_batch_size * args.gradient_accumulation_steps * args.dataset_world_size
