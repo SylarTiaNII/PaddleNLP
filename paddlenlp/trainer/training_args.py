@@ -32,7 +32,6 @@ import paddle.distributed as dist
 from paddle.distributed import fleet
 
 from ..utils.env import PREFIX_CHECKPOINT_DIR
-from ..utils.fault_tolerance import is_ft_env
 from ..utils.log import logger
 from ..utils.pdc_sdk import FLASH_DEVICE
 from .trainer_utils import (
@@ -1050,6 +1049,12 @@ class TrainingArguments:
         default=0,
         metadata={"help": "Save checkpoints on flash device every this many steps. Default is 0 which disables it"},
     )
+    flash_resume_step: Optional[int] = field(
+        default=-1,
+        metadata={
+            "help": "Resume step from flash device. This setting will override resume_from_checkpoint. If set to negative values, no checkpoints from flash device will be used for resuming."
+        },
+    )
 
     def __post_init__(self):
         if in_auto_parallel_align_mode():
@@ -1959,42 +1964,7 @@ class TrainingArguments:
                 refined_recompute_dict = dict()
             self.refined_recompute = refined_recompute_dict
 
-        # process fault tolerance settings
-        if is_ft_env():
-            pdc_zcc_init_step = os.getenv("PDC_FC_INIT_STEP")
-            if pdc_zcc_init_step is not None and int(pdc_zcc_init_step) > 0:
-                self.resume_from_checkpoint = os.path.join(
-                    FLASH_DEVICE, f"{PREFIX_CHECKPOINT_DIR}-{pdc_zcc_init_step}"
-                )
-                logger.warning(
-                    f"PDC_FC_INIT_STEP {pdc_zcc_init_step} has been specified, automatically resume from FLASH_DEVICE: {self.resume_from_checkpoint}"
-                )
-            if self.flash_device_save_steps > 0:
-                assert (
-                    self.enable_zero_cost_checkpoint
-                ), "flash_device_save_steps should only be set in zero cost checkpoint save mode with flash device mounted."
-        else:
-            if self.pdc_download_ckpt:
-                logger.warning(
-                    "pdc_download_ckpt can only be set as true inside FT environment. Automatically disable it now."
-                )
-                self.pdc_download_ckpt = False
-            if self.flash_device_save_steps > 0:
-                logger.warning(
-                    "flash_device_save_steps is only recommended to be set inside FT environment. Automatically disable it now."
-                )
-                self.flash_device_save_steps = 0
-
-        assert (
-            self.flash_device_save_steps % self.zcc_ema_interval == 0
-        ), f"flash_device_save_steps[{self.flash_device_save_steps}] must be divisible by zcc_ema_interval[{self.zcc_ema_interval}]"
-        assert (
-            self.save_steps % self.zcc_ema_interval == 0
-        ), f"save_steps[{self.save_steps}] must be divisible by zcc_ema_interval[{self.zcc_ema_interval}]"
-        if self.zcc_save_ema_coef is not None:
-            assert (
-                self.zcc_workers_num == 1
-            ), "EMA function in zero cost checkpoint mode does not support zcc_workers_num > 1 for now."
+        self.setup_zero_cost_checkpoint()
 
     def add_moe_comm_group(self):
         hcg = fleet.get_hybrid_communicate_group()
@@ -2026,6 +1996,36 @@ class TrainingArguments:
         logger.info(
             f"experts groups are created, expert_parallel_group: {hcg.expert_parallel_group}, expert_grad_comm_group: {hcg.expert_grad_comm_group}"
         )
+
+    def setup_zero_cost_checkpoint(self):
+        # priority: flash_resume_step > PDC_FC_INIT_STEP > resume_from_checkpoint
+        flash_resume_step = (
+            str(self.flash_resume_step) if self.flash_resume_step > 0 else os.getenv("PDC_FC_INIT_STEP", None)
+        )
+        if flash_resume_step and int(flash_resume_step) > 0:
+            self.resume_from_checkpoint = os.path.join(FLASH_DEVICE, f"{PREFIX_CHECKPOINT_DIR}-{flash_resume_step}")
+            logger.warning(
+                f"PDC_FC_INIT_STEP {flash_resume_step} has been specified, automatically resume from FLASH_DEVICE: {self.resume_from_checkpoint}"
+            )
+
+        if self.flash_device_save_steps > 0:
+            assert (
+                self.enable_zero_cost_checkpoint
+            ), "flash_device_save_steps should only be set in zero cost checkpoint save mode with flash device mounted."
+            logger.warning(
+                "saving checkpoints on flash device is enabled, be careful for maintaining your storage on shared memory device"
+            )
+
+        assert (
+            self.flash_device_save_steps % self.zcc_ema_interval == 0
+        ), f"flash_device_save_steps[{self.flash_device_save_steps}] must be divisible by zcc_ema_interval[{self.zcc_ema_interval}]"
+        assert (
+            self.save_steps % self.zcc_ema_interval == 0
+        ), f"save_steps[{self.save_steps}] must be divisible by zcc_ema_interval[{self.zcc_ema_interval}]"
+        if self.zcc_save_ema_coef is not None:
+            assert (
+                self.zcc_workers_num == 1
+            ), "EMA function in zero cost checkpoint mode does not support zcc_workers_num > 1 for now."
 
     def __str__(self):
         self_as_dict = asdict(self)
